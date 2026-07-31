@@ -1,0 +1,186 @@
+x-airflow-common:
+  &airflow-common
+  build:
+    context: .
+    dockerfile: Dockerfile
+
+  environment:
+    &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+    AIRFLOW__CORE__FERNET_KEY: ""
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.api_fastapi.auth.managers.simple.simple_auth_manager.SimpleAuthManager
+    AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_USERS: admin:admin
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-webserver:8080/execution/
+    AIRFLOW__API__BASE_URL: http://airflow-webserver:8080
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+    AIRFLOW_CONFIG: /opt/airflow/config/airflow.cfg
+    
+    AIRFLOW__API_AUTH__JWT_SECRET: "chembl-final-project-local-jwt-secret-2026"
+    AIRFLOW__API_AUTH__JWT_LEEWAY: "60"
+
+    AIRFLOW_CONN_AWS_S3: ${AIRFLOW_CONN_AWS_S3:-aws://?region_name=eu-central-1}
+    AIRFLOW_CONN_DWH_POSTGRES: ${AIRFLOW_CONN_DWH_POSTGRES:-postgresql://postgres:123456@local-db:5432/postgres}
+    AIRFLOW_CONN_MSTEAMS_WEBHOOK: ${AIRFLOW_CONN_MSTEAMS_WEBHOOK:-}
+
+    AWS_PROFILE: ${AWS_PROFILE:-De-School-students}
+    AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-eu-central-1}
+    AWS_SDK_LOAD_CONFIG: "1"
+
+    CHEMBL_RELEASE: ${CHEMBL_RELEASE:-37}
+    CHEMBL_AWS_CONN_ID: ${CHEMBL_AWS_CONN_ID:-aws_s3}
+    CHEMBL_S3_BUCKET: ${CHEMBL_S3_BUCKET:-de-school-educational-data}
+    CHEMBL_S3_PREFIX: ${CHEMBL_S3_PREFIX:-final_task/riabkova_maria}
+    CHEMBL_LOCAL_DATA_DIR: ${CHEMBL_LOCAL_DATA_DIR:-/opt/airflow/data/chembl}
+
+    _PIP_ADDITIONAL_REQUIREMENTS: ""
+
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./logs:/opt/airflow/logs
+    - ./config:/opt/airflow/config
+    - ./plugins:/opt/airflow/plugins
+    - ./data:/opt/airflow/data
+    - C:/Users/Maria/.aws:/home/airflow/.aws:ro
+
+  user: "${AIRFLOW_UID:-50000}:0"
+
+  depends_on:
+    postgres:
+      condition: service_healthy
+    local-db:
+      condition: service_healthy
+
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-db-volume:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow -d airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+  local-db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: "123456"
+      POSTGRES_DB: postgres
+    ports:
+      - "5433:5432"
+    volumes:
+      - dwh-db-volume:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+  airflow-init:
+    <<: *airflow-common
+    command:
+      - bash
+      - -c
+      - |
+        airflow db migrate
+        mkdir -p /opt/airflow/logs /opt/airflow/data /opt/airflow/config /opt/airflow/plugins
+    restart: "no"
+
+  airflow-webserver:
+    <<: *airflow-common
+    command: api-server
+    ports:
+      - "8081:8080"
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      local-db:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "curl",
+          "--fail",
+          "http://localhost:8080/api/v2/monitor/health"
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      local-db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "airflow jobs check --job-type SchedulerJob --hostname \"$${HOSTNAME}\""]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+
+  airflow-dag-processor:
+    <<: *airflow-common
+    command: dag-processor
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      local-db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "airflow jobs check --job-type DagProcessorJob --hostname \"$${HOSTNAME}\""]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+
+  airflow-triggerer:
+    <<: *airflow-common
+    command: triggerer
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      local-db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "airflow jobs check --job-type TriggererJob --hostname \"$${HOSTNAME}\""]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+
+
+volumes:
+  postgres-db-volume:
+  dwh-db-volume:
