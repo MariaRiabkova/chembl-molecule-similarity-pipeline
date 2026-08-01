@@ -2,38 +2,38 @@
 
 Data Engineering School 2026 final project.
 
-The project builds an Airflow-orchestrated pipeline that ingests ChEMBL data, stores the raw layer in AWS S3, loads a PostgreSQL DWH, computes Morgan fingerprints and Tanimoto similarities, and exposes the top-10 most similar molecules through a data mart and analytical views.
+The project implements an Apache Airflow pipeline for ingesting ChEMBL data, storing versioned raw datasets in AWS S3, and loading them into a PostgreSQL DWH. The next stages generate Morgan fingerprints, calculate Tanimoto similarities, build a dimensional data mart, and expose analytical views.
 
 ## Project goal
 
-For a given set of source molecules, the pipeline identifies the 10 most similar ChEMBL molecules using Morgan fingerprints and Tanimoto similarity.
+For a selected set of source molecules, the final pipeline must identify the 10 most similar ChEMBL molecules using Morgan fingerprints and Tanimoto similarity.
 
 The solution includes:
 
-- automated ChEMBL ingestion;
+- automated ingestion from the ChEMBL REST API;
 - versioned raw storage in AWS S3;
-- PostgreSQL DWH with at least two layers;
+- PostgreSQL DWH with `ods` and `data_mart` layers;
 - Morgan fingerprint generation with RDKit;
-- full similarity result storage in Parquet;
+- full similarity results stored as Parquet in S3;
 - top-10 similarity selection;
 - dimensional data mart;
 - analytical PostgreSQL views;
 - Airflow orchestration;
-- data quality checks;
+- data-quality validation;
 - failure notifications;
-- tests;
-- a short recorded demo.
+- automated tests;
+- a recorded project demo.
 
 ## Technology stack
 
-- Python 3
+- Python 3.13
 - Apache Airflow 3
 - PostgreSQL 16
+- Docker Compose
 - AWS S3
 - AWS SSO
-- Docker Compose
 - PyArrow
-- Pandas
+- Psycopg 3
 - RDKit
 - SQL
 - Pytest
@@ -44,17 +44,21 @@ The solution includes:
 ChEMBL REST API
         |
         v
-Airflow raw ingestion DAG
+chembl_raw_ingestion
         |
         v
 AWS S3 raw layer
-final_task/riabkova_maria/raw/chembl_<release>/
+raw/chembl_<release>/
+        |
+        |  Airflow Asset event
+        v
+chembl_ods_ingestion
         |
         v
 PostgreSQL ODS
         |
         v
-Fingerprint generation
+Morgan fingerprint generation
         |
         v
 AWS S3 fingerprint layer
@@ -71,35 +75,46 @@ PostgreSQL data mart
 Analytical views
 ```
 
-The PostgreSQL DWH is launched locally through Docker Compose. Airflow uses a separate PostgreSQL database for its internal metadata.
+Airflow and the DWH use separate PostgreSQL services:
 
-## DWH layers
+- `postgres` — Airflow metadata database;
+- `local-db` — project DWH.
 
-The warehouse uses at least two logical layers:
+Both databases use named Docker volumes, so data survives `docker compose stop` and ordinary `docker compose down`.
+
+## Repository structure
 
 ```text
-ods
-data_mart
+.
+├── dags/
+│   ├── chembl_raw_ingestion_dag.py
+│   ├── chembl_ods_ingestion_dag.py
+│   ├── lib/
+│   │   ├── assets.py
+│   │   ├── chembl/
+│   │   │   ├── constants.py
+│   │   │   ├── raw_ingestion.py
+│   │   │   └── ods_ingestion.py
+│   │   └── utils/
+│   │       ├── s3.py
+│   │       └── teams.py
+│   └── sql/
+│       └── ods/
+├── scripts/
+│   └── compact_raw_parquet_fixed_windows.py
+├── tests/
+├── data/
+├── config/
+├── logs/
+├── plugins/
+├── docker-compose.yml
+├── Dockerfile
+├── requirements.txt
+├── .env.example
+└── README.md
 ```
 
-### ODS
-
-The ODS layer stores the four required ChEMBL datasets:
-
-- `ods.chembl_id_lookup`
-- `ods.molecule_dictionary`
-- `ods.compound_properties`
-- `ods.compound_structures`
-
-### Data mart
-
-The data mart contains:
-
-- a molecule dimension with the properties required by the assignment;
-- a similarity fact table with source molecule, target molecule, Tanimoto score and the boundary duplicate flag;
-- analytical views for similarity and molecule-property analysis.
-
-## S3 structure
+## S3 layout
 
 All project objects are stored under:
 
@@ -107,57 +122,70 @@ All project objects are stored under:
 s3://de-school-educational-data/final_task/riabkova_maria/
 ```
 
-Current raw structure:
+Raw releases are isolated by ChEMBL release number:
 
 ```text
 final_task/riabkova_maria/
 └── raw/
+    ├── chembl_35/
+    │   ├── chembl_id_lookup.parquet
+    │   ├── molecule_dictionary.parquet
+    │   ├── compound_properties.parquet
+    │   ├── compound_structures.parquet
+    │   └── metadata.json
     └── chembl_37/
         ├── chembl_id_lookup.parquet
         ├── molecule_dictionary.parquet
         ├── compound_properties.parquet
         ├── compound_structures.parquet
-        ├── metadata.json
-        └── _SUCCESS
-```
-
-Future releases are stored separately:
-
-```text
-raw/chembl_38/
-raw/chembl_39/
+        └── metadata.json
 ```
 
 Old releases are not deleted automatically.
 
-## ChEMBL ingestion strategy
+## Raw ingestion DAG
 
-The ingestion DAG accepts two runtime parameters:
+DAG ID:
+
+```text
+chembl_raw_ingestion
+```
+
+Runtime parameters:
 
 ```json
 {
   "chembl_release": 37,
-  "max_records": 1000
+  "max_records": 1000,
+  "overwrite": false
 }
 ```
 
-Parameters:
+Parameter behavior:
 
-- `chembl_release` — ChEMBL release number used for versioned S3 storage;
-- `max_records` — maximum number of records to ingest;
-- `max_records = 0` — ingest the full dataset.
+- `chembl_release` — release identifier used in S3 paths and metadata;
+- `max_records` — maximum number of records for a test load;
+- `max_records = 0` — full API load;
+- `overwrite = true` — reload even when the release is already marked complete.
 
-The DAG checks:
+Expected S3 prefix:
 
 ```text
-raw/chembl_<release>/metadata.json
+final_task/riabkova_maria/raw/chembl_<release>/
 ```
 
-If metadata contains a matching release, `status = complete`, a suitable `max_records` value, and all four required Parquet files exist, ingestion is skipped and the DAG finishes successfully.
+The DAG:
 
-If the folder or metadata does not exist, metadata is incomplete, files are missing, or the stored sample does not satisfy the requested load size, the release is ingested again and existing files are replaced.
+1. checks whether the requested release is already complete;
+2. extracts `chembl_id_lookup`;
+3. extracts molecule dictionary, properties, and structures;
+4. writes Parquet files locally;
+5. uploads all files into the release-specific S3 prefix;
+6. validates the uploaded objects;
+7. writes completion metadata;
+8. publishes the raw release as an Airflow Asset.
 
-A completed release has metadata similar to:
+Example completion metadata:
 
 ```json
 {
@@ -175,58 +203,172 @@ A completed release has metadata similar to:
 }
 ```
 
-The `_SUCCESS` zero-byte object is written only after all files have been uploaded and validated.
+### Release handling
 
-## Compact Parquet files
+The release number is passed explicitly into the export, upload, and validation functions.
 
-Only columns required for downstream processing and the final data mart are kept in the compact raw files.
+Parquet files are uploaded to:
 
-This is especially important for `compound_structures`. Large text fields such as `molfile` are not required for Morgan fingerprint calculation and significantly increase storage size.
+```text
+raw/chembl_<release>/<file_name>
+```
 
-The compact structure dataset keeps the identifiers and structure representation needed by RDKit, including:
+They are not written directly into the shared `raw/` root.
 
-- `molecule_chembl_id`;
-- `canonical_smiles`;
-- `standard_inchi_key`.
+The public ChEMBL REST API exposes the current release. The `chembl_release` parameter controls project versioning and metadata; it does not force the API to return an arbitrary historical database release. Historical releases should be loaded from an official versioned ChEMBL dump when exact historical content is required.
 
-Parquet files are written with Zstandard compression.
+## Raw datasets
 
-## API reliability
+The project ingests the four datasets required by the assignment:
 
-ChEMBL data is fetched through the ChEMBL REST API.
+- `chembl_id_lookup`;
+- `molecule_dictionary`;
+- `compound_properties`;
+- `compound_structures`.
 
-The ingestion implementation uses:
+Large raw files may be compacted before upload, but the resulting schemas must remain compatible with the ODS loader.
 
-- persistent HTTP sessions;
-- pagination;
-- batching;
-- retries for temporary server errors;
-- exponential backoff;
-- request timeouts;
-- streaming writes to Parquet.
+### Compact `compound_structures`
 
-Temporary API errors such as HTTP 500 do not immediately fail the task. The failed page is retried.
+The compact file keeps:
 
-For a production-scale historical reload, an official ChEMBL database dump may be preferable to the REST API because it avoids REST pagination and request-rate limitations. The ingestion operation must still remain automated inside the pipeline.
+```text
+molecule_chembl_id
+canonical_smiles
+standard_inchi
+standard_inchi_key
+```
 
-## ChEMBL release limitation
+The large `molfile` column is removed because Morgan fingerprints are calculated from SMILES and the field greatly increases file size.
 
-The public ChEMBL REST API exposes the currently active release. The `chembl_release` DAG parameter controls versioned storage and expected metadata; it does not make the API serve an arbitrary historical release.
+### Compact `compound_properties`
 
-Historical releases should be loaded from an official versioned ChEMBL dump if required.
+The compact file keeps the columns expected by the ODS transformation:
 
-## Missing ChEMBL 37 properties
+```text
+molecule_chembl_id
+alogp
+aromatic_rings
+full_molformula
+full_mwt
+hba
+hbd
+heavy_atoms
+mw_freebase
+np_likeness_score
+num_ro5_violations
+psa
+qed_weighted
+ro3_pass
+rtb
+cx_logp
+molecular_species
+```
 
-The assignment requires these dimension columns:
+The one-time compaction utility processes the source file in PyArrow batches and writes Zstandard-compressed Parquet without loading the complete dataset into memory.
 
-- `cx_logp`
-- `molecular_species`
+## ODS ingestion DAG
 
-They are not available in ChEMBL release 37.
+DAG ID:
 
-The columns are retained in the molecule dimension to satisfy the required schema and are populated with `NULL`.
+```text
+chembl_ods_ingestion
+```
 
-An optional enhancement would be to backfill these properties from an earlier ChEMBL release.
+The DAG is scheduled by the raw release Airflow Asset. It reads the release metadata from the triggering asset event, including:
+
+- ChEMBL release;
+- load scope;
+- maximum record count;
+- S3 bucket;
+- S3 release prefix.
+
+The ODS DAG:
+
+1. resolves the raw release context;
+2. creates required ODS objects;
+3. registers the release as loading;
+4. loads active compounds;
+5. loads molecule dictionary, compound properties, and compound structures;
+6. validates release-specific row counts;
+7. finalizes the release;
+8. rebuilds current/master ODS tables;
+9. publishes the completed ODS release as an Airflow Asset.
+
+The three main molecule datasets are loaded in parallel after active compounds are available.
+
+### ODS load implementation
+
+Parquet files are:
+
+1. downloaded from S3;
+2. read in configurable batches;
+3. checked against the required schema;
+4. streamed into temporary PostgreSQL staging tables;
+5. transformed into versioned ODS tables.
+
+Loading uses:
+
+```text
+PostgresHook
+    -> psycopg connection
+    -> cursor.copy(...)
+    -> write_row(...)
+```
+
+Temporary CSV files are not used.
+
+Default batch size:
+
+```text
+100000 rows
+```
+
+Transformation scripts containing multiple SQL statements are executed using Psycopg client-side parameter binding.
+
+## DWH layers
+
+The warehouse contains two logical schemas:
+
+```text
+ods
+data_mart
+```
+
+### ODS
+
+The ODS layer stores versioned ChEMBL data and current/master tables derived from completed releases.
+
+Core datasets:
+
+- active ChEMBL compounds;
+- molecule dictionary;
+- compound properties;
+- compound structures;
+- release metadata.
+
+### Data mart
+
+The planned data mart contains:
+
+- molecule dimension;
+- molecule-similarity fact table;
+- analytical views.
+
+The molecule dimension must include:
+
+- `chembl_id`;
+- `molecule_type`;
+- `mw_freebase`;
+- `alogp`;
+- `psa`;
+- `cx_logp`;
+- `molecular_species`;
+- `full_mwt`;
+- `aromatic_rings`;
+- `heavy_atoms`.
+
+Only molecules referenced by the similarity fact table should be included.
 
 ## Fingerprints
 
@@ -237,50 +379,37 @@ radius = 2
 nBits = 2048
 ```
 
-Fingerprints are calculated for all valid compound structures and stored in S3.
+Fingerprints are calculated for valid compound structures and stored as files in S3.
 
-Invalid or missing structures are excluded from fingerprint and similarity calculations and are reported by data quality checks.
+Invalid or missing structures are excluded from fingerprint and similarity processing and must be reported by data-quality checks.
 
 ## Similarity calculation
 
-Tanimoto similarity is calculated between each source molecule and the available ChEMBL target fingerprints.
+Tanimoto similarity is calculated between each selected source molecule and available ChEMBL target fingerprints.
 
-For each source molecule:
+For every source molecule:
 
-- the full similarity result is saved as Parquet in S3;
-- the highest-scoring 10 target molecules are loaded into the fact table;
-- boundary ties are marked with `has_duplicates_of_last_largest_score`.
+- the full similarity result is written to Parquet in S3;
+- the 10 highest-scoring targets are loaded into the fact table;
+- ties at the top-10 boundary are marked with `has_duplicates_of_last_largest_score`.
 
-The duplicate flag applies only when additional target molecules have the same similarity score as the last included row in the top-10.
+The flag is set when additional molecules outside the selected ten have the same score as the final included target.
 
-## Full and sample calculation modes
+## Required analytical views
 
-Full ChEMBL similarity computation can be expensive in execution time, memory and output size.
-
-The project supports:
-
-- full calculation mode;
-- configurable sample calculation mode.
-
-Fingerprints should normally be calculated for all valid ChEMBL structures. Similarity calculation may use a documented subset when full execution is not practical in the available course environment.
-
-Benchmark results, limitations and the selected compromise must be documented in this README before final delivery.
-
-## Analytical views
-
-The final PostgreSQL views include:
+The final project must provide:
 
 - average similarity score per source molecule;
 - average absolute deviation of target `alogp` from source `alogp`;
 - pivot output for 10 selected source molecules;
-- source and target ranking with the next and second-most-similar target identifiers;
+- source and target ranking using window functions;
 - average similarity grouped by:
   - source molecule;
   - source aromatic rings and heavy atoms;
   - source heavy atoms;
-  - whole dataset.
+  - the complete dataset.
 
-The whole-dataset aggregation uses `TOTAL` instead of aggregation-generated `NULL` values and does not use `UNION` or `UNION ALL`.
+The complete-dataset aggregation must replace aggregation-generated `NULL` values with `TOTAL` and must not use `UNION` or `UNION ALL`.
 
 ## Local setup
 
@@ -291,24 +420,23 @@ Install:
 - Docker Desktop;
 - Docker Compose;
 - AWS CLI v2;
-- AWS Session Manager / SSO support;
 - Git.
 
 ### AWS authentication
 
-Authenticate before starting S3 tasks:
+Authenticate before running S3 tasks:
 
 ```powershell
 aws sso login --profile De-School-students
 ```
 
-Verify the session:
+Verify the active identity:
 
 ```powershell
 aws sts get-caller-identity --profile De-School-students
 ```
 
-The local AWS configuration directory is mounted read-only into the Airflow containers.
+The local AWS configuration directory is mounted read-only into Airflow containers.
 
 ### Environment variables
 
@@ -323,27 +451,40 @@ AWS_PROFILE=De-School-students
 AWS_DEFAULT_REGION=eu-central-1
 
 AIRFLOW_CONN_AWS_S3=aws://?region_name=eu-central-1
+AIRFLOW_CONN_DWH_POSTGRES=postgresql://postgres:123456@local-db:5432/postgres
 
 CHEMBL_AWS_CONN_ID=aws_s3
 CHEMBL_S3_BUCKET=de-school-educational-data
 CHEMBL_S3_PREFIX=final_task/riabkova_maria
 CHEMBL_LOCAL_DATA_DIR=/opt/airflow/data/chembl
-
-AIRFLOW_CONN_DWH_POSTGRES=postgresql://postgres:123456@local-db:5432/postgres
 ```
 
-Do not commit secrets, access keys, passwords or webhook URLs.
+Do not commit access keys, session tokens, passwords, or webhook URLs.
 
 ### Start the project
+
+Build and start the environment:
 
 ```powershell
 docker compose up -d --build
 ```
 
-Check services:
+Check service status:
 
 ```powershell
 docker compose ps
+```
+
+Check DAG import errors:
+
+```powershell
+docker compose exec airflow-scheduler airflow dags list-import-errors
+```
+
+Expected output:
+
+```text
+No data found
 ```
 
 Airflow UI:
@@ -352,7 +493,7 @@ Airflow UI:
 http://localhost:8081
 ```
 
-Local DWH connection from the host machine:
+Local DWH connection:
 
 ```text
 Host: localhost
@@ -363,81 +504,78 @@ Password: 123456
 SSL: disable
 ```
 
-Airflow connects to the same DWH internally using:
+Internal Airflow DWH connection:
 
 ```text
 Host: local-db
 Port: 5432
+Database: postgres
 ```
 
-## Airflow DAGs
+## Docker data persistence
 
-### `chembl_raw_ingestion`
-
-Purpose:
-
-- check whether the requested ChEMBL release already exists;
-- ingest lookup and molecule datasets;
-- write compact Parquet files;
-- upload files to S3;
-- validate uploaded objects;
-- write `metadata.json`;
-- write `_SUCCESS`.
-
-Expected skip path:
+The Docker Compose environment uses named volumes:
 
 ```text
-start
-  -> check_release_status
-  -> release_already_complete
-  -> finish
+chembl-molecule-similarity-pipeline_dwh-db-volume
+chembl-molecule-similarity-pipeline_postgres-db-volume
 ```
 
-Expected ingestion path:
+Safe commands:
 
-```text
-start
-  -> check_release_status
-  -> export_molecule_tables
-  -> export_chembl_id_lookup
-  -> upload_raw_files_to_s3
-  -> validate_raw_files_in_s3
-  -> mark_release_complete
-  -> finish
+```powershell
+docker compose stop
+docker compose down
+docker compose up -d
 ```
 
-### Planned downstream DAGs
+These commands preserve PostgreSQL data.
 
-```text
-chembl_ods_load
-fingerprint_generation
-molecule_similarity
-data_mart_build
+Do not use the following unless database deletion is intended:
+
+```powershell
+docker compose down -v
+docker volume rm <volume>
+docker system prune --volumes
 ```
 
-These may be implemented as separate DAGs or as clearly separated task groups.
+## Useful validation commands
 
-## PostgreSQL schemas
+List release files in S3:
 
-Create the schemas before loading data:
+```powershell
+aws s3 ls `
+  s3://de-school-educational-data/final_task/riabkova_maria/raw/chembl_37/ `
+  --profile De-School-students
+```
+
+Inspect Parquet columns:
+
+```powershell
+python -c "import pyarrow.parquet as pq; print(pq.ParquetFile(r'.\data\chembl\raw\compound_structures.parquet').schema_arrow.names)"
+```
+
+List ODS tables:
+
+```powershell
+docker compose exec local-db psql `
+  -U postgres `
+  -d postgres `
+  -c "\dt ods.*"
+```
+
+Check release row counts:
 
 ```sql
-CREATE SCHEMA IF NOT EXISTS ods;
-CREATE SCHEMA IF NOT EXISTS data_mart;
-```
-
-Check them:
-
-```sql
-SELECT schema_name
-FROM information_schema.schemata
-WHERE schema_name IN ('ods', 'data_mart')
-ORDER BY schema_name;
+SELECT chembl_release, COUNT(*)
+FROM ods.molecule_dictionary
+GROUP BY chembl_release
+ORDER BY chembl_release;
 ```
 
 ## Tests
 
-Run tests inside the project environment:
+Run:
 
 ```powershell
 pytest
@@ -446,112 +584,86 @@ pytest
 The test suite should cover:
 
 - normalization functions;
-- retry behavior;
+- API retries and pagination;
+- release-specific S3 key construction;
 - metadata validation;
 - release skip/reload logic;
-- S3 key construction;
-- compact column selection;
-- fingerprint generation;
+- compact Parquet schemas;
+- ODS staging and transformation logic;
+- data-quality validation;
+- Morgan fingerprint generation;
 - Tanimoto similarity;
-- top-10 boundary duplicate logic;
-- SQL data quality assumptions.
+- top-10 boundary tie logic;
+- analytical SQL assumptions.
 
 ## Failure notifications
 
-Airflow failure callbacks send notifications to the shared MS Teams test-alert channel through a webhook stored in an Airflow Connection or environment secret.
+Airflow failure callbacks may send alerts to the shared MS Teams channel through a webhook stored in an Airflow Connection or environment variable.
 
-The webhook must never be committed to Git.
-
-## Repository structure
-
-```text
-.
-├── dags/
-│   ├── chembl_raw_ingestion_dag.py
-│   ├── lib/
-│   │   ├── chembl/
-│   │   │   ├── constants.py
-│   │   │   └── raw_ingestion.py
-│   │   └── utils/
-│   │       ├── s3.py
-│   │       └── teams.py
-│   └── sql/
-├── scripts/
-│   └── compact_raw_parquet.py
-├── tests/
-├── data/
-├── docker-compose.yml
-├── Dockerfile
-├── requirements.txt
-├── .env.example
-└── README.md
-```
+Webhook URLs must never be committed to Git.
 
 ## Current implementation status
 
 Completed:
 
 - Docker Compose environment;
-- Airflow deployment;
-- local PostgreSQL DWH service;
+- Airflow 3 deployment;
+- separate Airflow metadata and DWH PostgreSQL services;
+- persistent PostgreSQL volumes;
 - AWS SSO integration;
 - versioned ChEMBL raw ingestion;
-- full ChEMBL 37 extraction;
-- compact Parquet conversion;
-- raw data upload to S3;
-- `metadata.json` and `_SUCCESS` convention;
-- release skip/reload branching logic;
-- creation of `ods` and `data_mart` schemas.
+- release-specific S3 paths;
+- full and sample raw loading;
+- compact Parquet utility;
+- raw release metadata;
+- Airflow Asset publication;
+- asset-triggered ODS ingestion;
+- batch Parquet-to-PostgreSQL loading;
+- versioned ODS tables;
+- ODS validation and finalization;
+- successful end-to-end raw-to-ODS test.
 
 In progress:
 
-- loading raw Parquet files into ODS;
-- fingerprint generation;
+- Morgan fingerprint generation;
 - similarity calculation;
+- full similarity Parquet output;
+- top-10 fact loading;
 - dimensional data mart;
 - analytical views;
 - complete automated test coverage;
-- final notifications;
+- final notification workflow;
 - demo recording.
 
 ## Benchmark and limitations
 
 To be completed before final submission.
 
-The final README should include measured values for:
+The final README should include:
 
-- fingerprint generation time;
+- raw ingestion duration;
+- ODS load duration;
+- fingerprint generation duration;
 - similarity comparisons per second;
-- memory usage;
+- peak memory consumption;
 - expected full-run duration;
 - expected full-result storage size;
-- selected sample/full configuration for the demo environment.
-
-## Example results
-
-To be added after the data mart and views are complete.
-
-Example sections should include:
-
-- several source molecules;
-- their top-10 target molecules;
-- similarity scores;
-- duplicate-boundary flag;
-- output from each required analytical view.
+- configuration used for the final demo.
 
 ## Demo
 
-The final demo video must be no longer than 10 minutes and should show:
+The recorded demo must be no longer than 10 minutes and should show:
 
 1. architecture;
-2. project launch;
-3. Airflow DAGs;
-4. S3 raw and result structure;
+2. Docker startup;
+3. raw and ODS Airflow DAGs;
+4. release-specific S3 data;
 5. PostgreSQL DWH layers;
-6. fingerprint and similarity workflow;
-7. top-10 results;
-8. analytical views;
-9. data quality and failure notification behavior.
+6. fingerprint generation;
+7. similarity processing;
+8. top-10 output;
+9. analytical views;
+10. validation and failure handling.
 
 Demo link:
 
