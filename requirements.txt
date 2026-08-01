@@ -2,6 +2,7 @@ apache-airflow-providers-postgres>=6.0.0
 apache-airflow-providers-amazon>=9.0.0
 apache-airflow-providers-standard
 
+psycopg[binary]>=3.2,<4
 requests>=2.32.0
 pyarrow>=18.0.0
 pandas>=2.2.0
