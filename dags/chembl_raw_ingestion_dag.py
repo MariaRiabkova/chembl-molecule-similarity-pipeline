@@ -12,8 +12,10 @@ from airflow.providers.standard.operators.python import (
     BranchPythonOperator,
     PythonOperator,
 )
-from airflow.sdk import DAG, Param
+from airflow.sdk import DAG, Param, get_current_context
 from airflow.utils.trigger_rule import TriggerRule
+
+from lib.assets import CHEMBL_RAW_RELEASE_ASSET
 
 from lib.chembl.raw_ingestion import (
     export_chembl_id_lookup,
@@ -174,9 +176,7 @@ def mark_release_complete(
     chembl_release: int,
     max_records: int,
 ) -> None:
-    """
-    Write metadata.json and _SUCCESS only after successful validation.
-    """
+    """Write metadata.json only after successful raw-file validation."""
     release = int(chembl_release)
     record_limit = int(max_records)
     prefix = build_release_prefix(release)
@@ -205,12 +205,71 @@ def mark_release_complete(
         replace=True,
     )
 
-    hook.load_string(
-        string_data="",
-        key=f"{prefix}/_SUCCESS",
-        bucket_name=S3_BUCKET,
-        replace=True,
+
+def publish_raw_release_asset(
+    chembl_release: int,
+    max_records: int,
+) -> dict[str, Any]:
+    """
+    Validate the completed raw release and emit its Airflow asset event.
+
+    This task is shared by both branches:
+    - a newly extracted release;
+    - a release that was already complete in S3.
+
+    The stable asset URI identifies the logical raw dataset. The concrete
+    release number and S3 location are attached to the individual event.
+    """
+    release = int(chembl_release)
+    requested_max_records = int(max_records)
+    prefix = build_release_prefix(release)
+
+    hook = S3Hook(aws_conn_id=AWS_CONN_ID)
+    metadata = read_release_metadata(
+        hook=hook,
+        chembl_release=release,
     )
+
+    if metadata is None:
+        raise ValueError(
+            f"Missing or invalid metadata.json for ChEMBL {release}"
+        )
+
+    if not metadata_satisfies_request(
+        metadata=metadata,
+        chembl_release=release,
+        max_records=requested_max_records,
+    ):
+        raise ValueError(
+            "Raw metadata does not satisfy the requested release: "
+            f"release={release}, max_records={requested_max_records}"
+        )
+
+    if not all_required_files_exist(
+        hook=hook,
+        chembl_release=release,
+    ):
+        raise FileNotFoundError(
+            f"One or more required raw files are missing under "
+            f"s3://{S3_BUCKET}/{prefix}/"
+        )
+
+    event_extra: dict[str, Any] = {
+        "chembl_release": release,
+        "load_scope": metadata["load_scope"],
+        "max_records": int(metadata["max_records"]),
+        "s3_bucket": S3_BUCKET,
+        "s3_prefix": prefix,
+        "metadata_key": f"{prefix}/metadata.json",
+        "files": list(REQUIRED_PARQUET_FILES),
+    }
+
+    context = get_current_context()
+    context["outlet_events"][CHEMBL_RAW_RELEASE_ASSET].extra = (
+        event_extra
+    )
+
+    return event_extra
 
 
 with DAG(
@@ -323,14 +382,24 @@ with DAG(
         },
     )
 
+    publish_raw_asset = PythonOperator(
+        task_id="publish_raw_release_asset",
+        python_callable=publish_raw_release_asset,
+        op_kwargs={
+            "chembl_release": "{{ params.chembl_release }}",
+            "max_records": "{{ params.max_records }}",
+        },
+        outlets=[CHEMBL_RAW_RELEASE_ASSET],
+        trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS,
+    )
+
     finish = EmptyOperator(
         task_id="finish",
-        trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS,
     )
 
     start >> check_release_status
 
-    check_release_status >> release_already_complete >> finish
+    check_release_status >> release_already_complete
 
     check_release_status >> [
         export_molecule_tables_task,
@@ -342,4 +411,9 @@ with DAG(
         export_chembl_id_lookup_task,
     ] >> upload_raw_files
 
-    upload_raw_files >> validate_raw_files >> mark_complete >> finish
+    upload_raw_files >> validate_raw_files >> mark_complete
+
+    [
+        release_already_complete,
+        mark_complete,
+    ] >> publish_raw_asset >> finish

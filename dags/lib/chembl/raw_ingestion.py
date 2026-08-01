@@ -32,6 +32,20 @@ REQUEST_DELAY_SECONDS = 0.2
 MAX_RETRIES = 5
 
 
+
+def build_release_prefix(chembl_release: int) -> str:
+    """Return the versioned S3 prefix for a ChEMBL release."""
+    return (
+        f"{S3_RAW_PREFIX.rstrip('/')}/"
+        f"chembl_{int(chembl_release)}"
+    )
+
+
+def build_local_release_dir(chembl_release: int) -> Path:
+    """Return an isolated local working directory for a release."""
+    return LOCAL_RAW_DIR / f"chembl_{int(chembl_release)}"
+
+
 CHEMBL_ID_LOOKUP_SCHEMA = pa.schema(
     [
         ("chembl_id", pa.string()),
@@ -368,9 +382,10 @@ def _write_rows(
 
 
 def export_molecule_tables(
+    chembl_release: int,
     max_records: int = 1000,
 ) -> list[str]:
-    """Export three molecule datasets to Parquet."""
+    """Export three molecule datasets to a release-specific local directory."""
 
     record_limit = (
         None
@@ -378,21 +393,22 @@ def export_molecule_tables(
         else int(max_records)
     )
 
-    LOCAL_RAW_DIR.mkdir(
+    release_dir = build_local_release_dir(chembl_release)
+    release_dir.mkdir(
         parents=True,
         exist_ok=True,
     )
 
     dictionary_path = (
-        LOCAL_RAW_DIR
+        release_dir
         / "molecule_dictionary.parquet"
     )
     properties_path = (
-        LOCAL_RAW_DIR
+        release_dir
         / "compound_properties.parquet"
     )
     structures_path = (
-        LOCAL_RAW_DIR
+        release_dir
         / "compound_structures.parquet"
     )
 
@@ -491,9 +507,10 @@ def export_molecule_tables(
 
 
 def export_chembl_id_lookup(
+    chembl_release: int,
     max_records: int = 1000,
 ) -> str:
-    """Export chembl_id_lookup to Parquet."""
+    """Export chembl_id_lookup to a release-specific local directory."""
 
     record_limit = (
         None
@@ -501,13 +518,14 @@ def export_chembl_id_lookup(
         else int(max_records)
     )
 
-    LOCAL_RAW_DIR.mkdir(
+    release_dir = build_local_release_dir(chembl_release)
+    release_dir.mkdir(
         parents=True,
         exist_ok=True,
     )
 
     output_path = (
-        LOCAL_RAW_DIR
+        release_dir
         / "chembl_id_lookup.parquet"
     )
 
@@ -551,14 +569,24 @@ def export_chembl_id_lookup(
     return str(output_path)
 
 
-def upload_raw_files_to_s3() -> list[str]:
-    """Upload four Parquet files to S3 raw."""
-
+def upload_raw_files_to_s3(
+    chembl_release: int,
+) -> list[str]:
+    """Upload four Parquet files to the versioned S3 raw prefix."""
+    release = int(chembl_release)
+    release_dir = build_local_release_dir(release)
+    release_prefix = build_release_prefix(release)
     uploaded_keys: list[str] = []
 
     for file_name in RAW_FILE_NAMES:
-        local_path = LOCAL_RAW_DIR / file_name
-        s3_key = f"{S3_RAW_PREFIX}/{file_name}"
+        local_path = release_dir / file_name
+
+        if not local_path.is_file():
+            raise FileNotFoundError(
+                f"Local raw file does not exist: {local_path}"
+            )
+
+        s3_key = f"{release_prefix}/{file_name}"
 
         upload_file(
             local_path=local_path,
@@ -580,13 +608,16 @@ def upload_raw_files_to_s3() -> list[str]:
     return uploaded_keys
 
 
-def validate_raw_files_in_s3() -> None:
-    """Check that all expected files exist in S3."""
-
+def validate_raw_files_in_s3(
+    chembl_release: int,
+) -> None:
+    """Check that all expected files exist under the versioned S3 prefix."""
+    release = int(chembl_release)
+    release_prefix = build_release_prefix(release)
     missing_keys: list[str] = []
 
     for file_name in RAW_FILE_NAMES:
-        s3_key = f"{S3_RAW_PREFIX}/{file_name}"
+        s3_key = f"{release_prefix}/{file_name}"
 
         if not object_exists(
             key=s3_key,
@@ -602,7 +633,9 @@ def validate_raw_files_in_s3() -> None:
         )
 
     logger.info(
-        "All expected raw files exist in S3"
+        "All expected raw files exist under s3://%s/%s",
+        S3_BUCKET_NAME,
+        release_prefix,
     )
 def _to_float(value: Any) -> float | None:
     if value in (None, ""):
